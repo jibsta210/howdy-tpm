@@ -1,0 +1,192 @@
+#!/bin/bash
+# ===========================================================================
+# howdy-tpm — doctor / test / status for pam_howdy_tpm
+#
+#   sudo howdy-tpm doctor    inspect THIS machine, print the exact PAM lines
+#   sudo howdy-tpm test      verify the stack without rebooting
+#   sudo howdy-tpm status    is a credential enrolled? (never prints it)
+#
+# `doctor` exists because three things are guessed wrong nearly every time,
+# and each fails silently:
+#
+#   1. WHICH KEYRING actually prompts. Both kwalletd and gnome-keyring may be
+#      running; only one owns org.freedesktop.secrets. Wiring the other one
+#      changes nothing and looks like the module is broken.
+#   2. WHICH PAM SERVICE the greeter uses. Distro packages wire
+#      pam_gnome_keyring into /etc/pam.d/sddm; if you run greetd or
+#      cosmic-greeter that file is never read. The module works perfectly and
+#      you still get a prompt.
+#   3. WHICH PASSWORD the store wants. The GNOME login keyring uses your
+#      ACCOUNT password; KWallet has its own. Sealing the wrong one is
+#      indistinguishable from a wrong password.
+# ===========================================================================
+set -uo pipefail
+
+CRED=${HOWDY_TPM_CRED:-/etc/howdy-tpm/secret.cred}
+NAME=${HOWDY_TPM_NAME:-howdy-tpm}
+
+b(){ printf '\n\033[1m%s\033[0m\n' "$*"; }
+ok(){ printf '  \033[32m✓\033[0m %s\n' "$*"; }
+no(){ printf '  \033[31m✗\033[0m %s\n' "$*"; }
+hm(){ printf '  \033[33m!\033[0m %s\n' "$*"; }
+i_(){ printf '    %s\n' "$*"; }
+
+need_root(){ [[ $EUID -eq 0 ]] || { echo "run as root: sudo $0 $*"; exit 1; }; }
+
+# Which user is actually logged in graphically -- their session owns the
+# keyring daemon, and running these checks against root's session finds
+# nothing and reports a false negative.
+target_user(){
+  local u
+  u=$(loginctl list-sessions --no-legend 2>/dev/null \
+      | awk '$3!="root" && $3!="" {print $3; exit}')
+  [[ -n ${u:-} ]] || u=${SUDO_USER:-}
+  printf '%s' "$u"
+}
+
+doctor(){
+  need_root doctor
+  local u uid
+  u=$(target_user); uid=$(id -u "$u" 2>/dev/null || echo "")
+  b "Machine"
+  i_ "user            ${u:-<none found>}"
+
+  b "TPM"
+  if systemd-analyze has-tpm2 >/dev/null 2>&1; then
+    ok "TPM 2.0 usable"
+  else
+    no "no usable TPM 2.0 -- nothing to unseal from"; return 1
+  fi
+
+  b "Which keyring actually holds your secrets"
+  local owner comm=""
+  owner=$(sudo -u "$u" XDG_RUNTIME_DIR="/run/user/$uid" busctl --user call \
+          org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus \
+          GetNameOwner s org.freedesktop.secrets 2>/dev/null \
+          | awk '{print $2}' | tr -d '"')
+  if [[ -n ${owner:-} ]]; then
+    comm=$(sudo -u "$u" XDG_RUNTIME_DIR="/run/user/$uid" busctl --user status "$owner" 2>/dev/null \
+           | sed -n 's/^Comm=//p')
+    ok "org.freedesktop.secrets is owned by: ${comm:-$owner}"
+  else
+    hm "nothing owns org.freedesktop.secrets right now"
+  fi
+  pgrep -u "$u" -x kwalletd6 >/dev/null 2>&1 && i_ "kwalletd6 is also running"
+  pgrep -u "$u" -x gnome-keyring-d >/dev/null 2>&1 && i_ "gnome-keyring-daemon is also running"
+
+  local consumer pwkind
+  case "${comm:-}" in
+    gnome-keyring*) consumer="pam_gnome_keyring.so"; pwkind="your ACCOUNT password" ;;
+    kwalletd*)      consumer="pam_kwallet5.so";      pwkind="your KWallet password" ;;
+    *)              consumer="pam_gnome_keyring.so or pam_kwallet5.so"; pwkind="that store's password" ;;
+  esac
+  i_ "-> consumer module: $consumer"
+  i_ "-> seal $pwkind"
+
+  b "Which PAM service your greeter uses"
+  local dm svc="login"
+  dm=$(systemctl show display-manager.service -p Id --value 2>/dev/null)
+  case "$dm" in
+    sddm*)   svc="sddm" ;;
+    gdm*)    svc="gdm-password" ;;
+    greetd*|cosmic-greeter*)
+      svc=$(sed -n 's/^ *service *= *"\(.*\)".*/\1/p' /etc/greetd/*.toml 2>/dev/null | head -1)
+      [[ -n ${svc:-} ]] || svc="login" ;;
+  esac
+  ok "display manager: ${dm:-unknown} -> PAM service: $svc"
+  for f in sddm gdm-password greetd login; do
+    [[ -f /etc/pam.d/$f ]] && grep -qE '^-?(auth|session).*(gnome_keyring|kwallet)' /etc/pam.d/$f 2>/dev/null \
+      && i_ "keyring module currently wired in /etc/pam.d/$f"
+  done
+  grep -qE "^-?(auth|session).*(gnome_keyring|kwallet)" "/etc/pam.d/$svc" 2>/dev/null \
+    || hm "no keyring module in /etc/pam.d/$svc -- the one your greeter reads"
+
+  b "pam_howdy_tpm"
+  [[ -e /usr/lib/security/pam_howdy_tpm.so ]] && ok "module installed" || no "module NOT installed"
+  if [[ -f $CRED ]]; then
+    if systemd-creds decrypt --name="$NAME" "$CRED" - >/dev/null 2>&1; then
+      ok "credential enrolled and unseals"
+    else
+      no "credential exists but does NOT unseal (TPM cleared? wrong --name?)"
+    fi
+  else
+    hm "no credential yet -- run: sudo howdy-tpm-enroll"
+  fi
+  grep -rqs 'pam_howdy_tpm' /etc/pam.d/ && ok "referenced in a PAM stack" \
+    || hm "not in any PAM stack yet"
+
+  b "Add these lines"
+  i_ "In /etc/pam.d/system-auth, at pam_howdy's success= TARGET"
+  i_ "(run: howdy-tpm test --show-stack $svc  to see where that lands):"
+  i_ ""
+  i_ "    auth       optional      pam_howdy_tpm.so"
+  i_ ""
+  i_ "In /etc/pam.d/$svc, AFTER the include:"
+  i_ ""
+  i_ "    auth       optional      $consumer"
+  i_ "    session    optional      $consumer auto_start"
+  i_ ""
+  hm "back up first:  sudo cp /etc/pam.d/system-auth{,.bak}"
+  hm "adding a module SHIFTS every success=N below it -- recount with:"
+  i_ "    howdy-tpm test --show-stack $svc"
+}
+
+show_stack(){
+  local svc=${1:-login}
+  python3 - "$svc" <<'PY'
+import os, re, sys
+def flat(svc, seen=None):
+    seen = seen or set(); p = "/etc/pam.d/"+svc
+    if svc in seen or not os.path.exists(p): return []
+    seen.add(svc); out=[]
+    for l in open(p):
+        l=l.strip()
+        if not l or l.startswith('#'): continue
+        m=re.match(r'^(-?)(\w+)\s+(\[[^\]]*\]|\S+)\s+(\S+)(.*)$', l)
+        if not m: continue
+        _,ph,ctl,mod,args=m.groups()
+        if ph!='auth': continue
+        if ctl=='include': out+=flat(mod,seen)
+        else: out.append((ctl,mod,args.strip(),svc))
+    return out
+svc=sys.argv[1]; st=flat(svc)
+print("\n  auth stack for %r (%d modules)\n" % (svc,len(st)))
+for i,(ctl,mod,args,src) in enumerate(st):
+    print("   %2d  %-28s %-26s [%s]" % (i,ctl,mod,src))
+    j=re.search(r'success=(\d+)',ctl)
+    if j:
+        n=int(j.group(1)); t=i+1+n
+        where = st[t][1] if t < len(st) else "PAST THE END"
+        print("       success=%d -> lands on %d (%s)  <-- put pam_howdy_tpm HERE" % (n,t,where))
+PY
+}
+
+run_test(){
+  need_root test
+  local u; u=$(target_user)
+  if [[ ${1:-} == --show-stack ]]; then show_stack "${2:-login}"; return 0; fi
+  command -v pamtest >/dev/null 2>&1 || {
+    hm "pamtest not installed -- build it: gcc -o /usr/local/bin/pamtest tests/pamtest.c -lpam"
+    return 1; }
+  b "PAM test (answers no prompts -- a stack needing a password will fail)"
+  pamtest "${1:-login}" "$u"
+  echo
+  hm "failed attempts count toward faillock:  faillock --user $u --reset"
+}
+
+status(){
+  need_root status
+  [[ -f $CRED ]] || { no "no credential at $CRED"; exit 1; }
+  printf '  %s  %s  %s bytes\n' "$CRED" "$(stat -c '%U:%G %a' "$CRED")" "$(stat -c %s "$CRED")"
+  # Length only -- the value never reaches a terminal or a log.
+  local n
+  n=$(systemd-creds decrypt --name="$NAME" "$CRED" - 2>/dev/null | wc -c)
+  [[ ${n:-0} -gt 0 ]] && ok "unseals ($n bytes)" || no "does NOT unseal"
+}
+
+case "${1:-}" in
+  doctor) doctor ;;
+  test)   shift; run_test "$@" ;;
+  status) status ;;
+  *) sed -n '2,20p' "$0" | sed 's/^# \?//' ;;
+esac

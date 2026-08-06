@@ -217,16 +217,37 @@ you can find out deliberately rather than at a login screen.
 
 ## Status
 
-Working and tested on a Dell XPS 16 (Panther Lake, STMicro TPM 2.0), Howdy with
-an IR sensor, KDE Wallet.
+Working. Verified on a Dell XPS 16 (Panther Lake, STMicro TPM 2.0, kernel
+7.2-rc6) with Howdy on an IR sensor, cosmic-greeter, and the GNOME login
+keyring.
 
-Verified: secret delivered on the face path; existing token preserved on the
-password path; missing, world-readable and non-root-owned credentials each
-refused without setting a token or crashing.
+A real boot, from the journal:
 
-Not yet done: an installer that edits PAM stacks for you. Deliberately —
-that is the part that can lock you out, and it should be done deliberately with
-a restore command to hand.
+```
+pam_howdy: Login approved
+gkr-pam: stashed password to try later in open session
+pam_unix(login:session): session opened for user jakes
+```
+
+`stashed password` is the keyring receiving the token. On every boot before
+this, that line was `pam_kwallet5: Couldn't get password (it is empty)` and the
+greeter sat waiting for a password it had already been told it did not need.
+
+Face at the greeter, straight to the desktop, keyring unlocked, nothing typed.
+
+Also verified, in an isolated PAM service rather than by guessing:
+
+| case | result |
+|---|---|
+| no existing token | secret delivered, correct length |
+| token already set | left alone — `already set, doing nothing` |
+| credential mode 0644 | refused, no token set |
+| credential owned non-root | refused |
+| credential missing | no token, no crash |
+
+Not yet done: an installer that edits PAM stacks for you. Deliberately — that
+is the part that can lock you out. `howdy-tpm doctor` prints the exact lines
+for your machine and you add them yourself.
 
 ## Licence
 
