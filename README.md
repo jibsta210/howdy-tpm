@@ -52,10 +52,26 @@ stops unsealing if Secure Boot state changes.
 logged in, or anyone who can already run code as root. Nothing at this layer
 does.
 
-**Not a substitute for full-disk encryption.** If you can encrypt the disk, do
-that — `systemd-cryptenroll --tpm2-device=auto` gives unattended boot with no
-passphrase and protects everything, not just one secret. This module is for
-when you can't or won't.
+**Not a substitute for full-disk encryption**, and not trying to be. FDE
+protects far more. But the two fail very differently, and that difference is
+the reason to pick this:
+
+|  | TPM-backed FDE | this module |
+|---|---|---|
+| protects | the whole disk | one secret |
+| if the TPM is cleared | **the disk is unrecoverable** without the recovery passphrase | you type your password, as before, and re-enrol |
+| to adopt on an existing system | backup + reinstall, or an involved in-place conversion | install, enrol, add two PAM lines |
+| worst case if it breaks | you cannot boot | you get a password prompt |
+
+A firmware update that clears the TPM is a bad afternoon here and a catastrophe
+there. If you already run FDE, add this anyway — they compose. If you do not,
+this gets you face-unlocked secrets without betting your filesystem on the TPM
+staying intact.
+
+(For the record, since it comes up: `systemd-cryptenroll --tpm2-device=auto`
+does **not** add a preboot password — the TPM releases the key automatically.
+The passphrase exists only as a fallback slot. The reason to prefer this module
+is the blast radius above, not a password at boot.)
 
 **Howdy is not presentation-attack-resistant.** An IR sensor raises the bar
 over an RGB webcam, but this is not a certified biometric stack. Decide what
