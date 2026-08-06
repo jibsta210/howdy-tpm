@@ -32,9 +32,15 @@ one encoding is unrelated to a hash of the next, so there is nothing stable to
 derive a key from. And a face is not secret in the first place — your model
 file sits on disk next to the data it would be protecting.
 
-So the biometric authorises; the TPM holds. This is the same split Windows
-Hello uses to unlock BitLocker, and it is the only arrangement where "unlock
-with your face" is not a synonym for "keep the password in a file".
+So the biometric authorises; the TPM holds. That is the only arrangement where
+"unlock with your face" is not a synonym for "keep the password in a file".
+
+Windows uses the same pattern, though in two independent places that are easy
+to conflate: BitLocker has the TPM release the volume key **at boot**, from PCR
+measurements, before any user exists — Hello is not involved. Hello separately
+has the TPM release your *credentials* after a biometric match, once you are at
+the login screen. This module is the second of those. The first is
+`systemd-cryptenroll --tpm2-device=auto`, and the two compose.
 
 ---
 
