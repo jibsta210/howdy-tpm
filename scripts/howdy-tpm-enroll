@@ -1,0 +1,162 @@
+#!/bin/bash
+# ===========================================================================
+# howdy-tpm-enroll — seal a secret to the TPM for release on face auth
+#
+#   sudo howdy-tpm-enroll                 # prompt, seal to the default path
+#   sudo howdy-tpm-enroll --name mywallet --cred /etc/howdy-tpm/other.cred
+#   sudo howdy-tpm-enroll --show          # what is enrolled (never the secret)
+#   sudo howdy-tpm-enroll --remove        # delete the sealed credential
+#   sudo howdy-tpm-enroll --pcrs 7        # additionally bind to PCR 7
+#
+# The secret is read from a hidden prompt, piped straight to systemd-creds,
+# and never written anywhere in plaintext -- not to a file, not to argv, not
+# to the shell history.
+#
+# ⚠ THE ONE THING TO UNDERSTAND BEFORE RUNNING THIS
+#   A TPM-sealed secret is recoverable ONLY by this TPM, on this machine. If
+#   the TPM is cleared -- a firmware update, a BIOS reset, "Clear TPM" in
+#   setup, or moving the drive to another machine -- the sealed blob becomes
+#   permanently undecryptable.
+#
+#   That is the entire security value. It is also the entire risk. Whatever
+#   you seal here, you must still know by other means. Write it down and put
+#   it somewhere that is not this laptop.
+# ===========================================================================
+set -euo pipefail
+
+CRED=/etc/howdy-tpm/secret.cred
+NAME=howdy-tpm
+PCRS=""
+ACTION=enroll
+
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		--cred)   CRED=$2; shift 2 ;;
+		--name)   NAME=$2; shift 2 ;;
+		--pcrs)   PCRS=$2; shift 2 ;;
+		--show)   ACTION=show; shift ;;
+		--remove) ACTION=remove; shift ;;
+		-h|--help) sed -n '2,26p' "$0" | sed 's/^# \?//'; exit 0 ;;
+		*) echo "unknown option: $1" >&2; exit 2 ;;
+	esac
+done
+
+[[ $EUID -eq 0 ]] || { echo "run as root: sudo $0 $*" >&2; exit 1; }
+
+command -v systemd-creds >/dev/null 2>&1 || {
+	echo "systemd-creds not found (needs systemd with TPM2 support)" >&2; exit 1; }
+
+case $ACTION in
+show)
+	if [[ -f $CRED ]]; then
+		printf 'credential : %s\n' "$CRED"
+		printf 'name       : %s\n' "$NAME"
+		printf 'perms      : %s\n' "$(stat -c '%U:%G %a' "$CRED")"
+		printf 'size       : %s bytes\n' "$(stat -c%s "$CRED")"
+		printf 'sealed     : %s\n' "$(stat -c '%y' "$CRED" | cut -d. -f1)"
+		# Prove it still unseals WITHOUT printing it. If a firmware update
+		# has cleared the TPM this is how you find out deliberately, rather
+		# than by being locked out of your wallet one morning.
+		if systemd-creds decrypt --name="$NAME" "$CRED" - >/dev/null 2>&1; then
+			printf 'unseals    : yes\n'
+		else
+			printf 'unseals    : NO -- TPM state has changed since sealing\n'
+			exit 1
+		fi
+	else
+		printf 'no credential at %s\n' "$CRED"
+		exit 1
+	fi
+	exit 0 ;;
+remove)
+	rm -f -- "$CRED" && echo "removed $CRED"
+	echo "PAM will fall back to prompting for a password."
+	exit 0 ;;
+esac
+
+# --- enrol ------------------------------------------------------------------
+
+if ! systemd-analyze has-tpm2 >/dev/null 2>&1; then
+	echo "This system reports no usable TPM2. Run 'systemd-analyze has-tpm2' to see what is missing." >&2
+	exit 1
+fi
+
+cat <<'EOF'
+
+  Seal a secret to this machine's TPM.
+
+  Typically your KDE Wallet password -- the one you are asked for after
+  logging in. Once sealed, PAM releases it automatically when Howdy
+  recognises your face, and you stop being asked.
+
+EOF
+
+if [[ -f $CRED ]]; then
+	printf '  A credential already exists at %s\n' "$CRED"
+	read -rp "  Replace it? [y/N] " ans
+	[[ ${ans,,} == y* ]] || { echo "  unchanged"; exit 0; }
+	echo
+fi
+
+# read -s: never echoed, never in argv, never in history.
+printf '  Secret: '
+read -rs SECRET
+echo
+printf '  Again : '
+read -rs SECRET2
+echo
+echo
+
+if [[ "$SECRET" != "$SECRET2" ]]; then
+	unset SECRET SECRET2
+	echo "  They do not match. Nothing was sealed." >&2
+	exit 1
+fi
+unset SECRET2
+
+if [[ -z $SECRET ]]; then
+	unset SECRET
+	echo "  Empty secret. Nothing was sealed." >&2
+	exit 1
+fi
+
+install -dm700 "$(dirname "$CRED")"
+
+ARGS=(encrypt --with-key=tpm2 --name="$NAME")
+[[ -n $PCRS ]] && ARGS+=(--tpm2-pcrs="$PCRS")
+
+# printf '%s' NOT echo: echo appends a newline, systemd-creds is byte-exact,
+# and the newline would travel all the way into PAM_AUTHTOK and make every
+# unlock fail while looking exactly like a wrong password.
+if ! printf '%s' "$SECRET" | systemd-creds "${ARGS[@]}" - "$CRED" 2>/dev/null; then
+	unset SECRET
+	echo "  Sealing failed. Nothing was written." >&2
+	exit 1
+fi
+unset SECRET
+
+chown root:root "$CRED"
+chmod 600 "$CRED"
+
+# Read it back before claiming success. A credential that seals but does not
+# unseal is worse than none: you would find out at the login screen.
+if ! systemd-creds decrypt --name="$NAME" "$CRED" - >/dev/null 2>&1; then
+	rm -f -- "$CRED"
+	echo "  Sealed, but could not read it back. Removed it rather than leave you a broken credential." >&2
+	exit 1
+fi
+
+cat <<EOF
+  Sealed to $CRED (root:root 600), verified readable.
+EOF
+[[ -n $PCRS ]] && printf '  Bound to PCR(s) %s -- a firmware or Secure Boot change will invalidate it.\n' "$PCRS"
+cat <<'EOF'
+
+  Next: add the module to your PAM stack. See README, or run
+
+      sudo howdy-tpm-install
+
+  ⚠ Write the secret down somewhere off this machine. If the TPM is ever
+    cleared, this blob is unrecoverable and nothing here can bring it back.
+
+EOF
