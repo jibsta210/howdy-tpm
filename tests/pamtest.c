@@ -1,6 +1,6 @@
 /* Minimal PAM auth test. Answers NO prompts -- if the stack needs a password
  * it fails, if howdy alone satisfies it we get PAM_SUCCESS. That is exactly
- * the question: does service "login" authenticate this user with face only? */
+ * the question: does the selected service authenticate this user with face only? */
 #include <security/pam_appl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,11 +26,16 @@ static int conv(int n, const struct pam_message **m,
 
 int main(int argc, char **argv)
 {
-	const char *svc = argc > 1 ? argv[1] : "login";
-	const char *usr = argc > 2 ? argv[2] : "jakes";
+	if (argc < 3 || argc > 4) {
+		fprintf(stderr, "usage: pamtest SERVICE USER [ISOLATED_CONFIG_DIR]\n");
+		return 2;
+	}
+	const char *svc = argv[1];
+	const char *usr = argv[2];
 	struct pam_conv c = { conv, NULL };
 	pam_handle_t *h = NULL;
-	int rc = pam_start(svc, usr, &c, &h);
+	int rc = argc == 4 ? pam_start_confdir(svc, usr, &c, argv[3], &h)
+	                   : pam_start(svc, usr, &c, &h);
 	if (rc != PAM_SUCCESS) { printf("  pam_start: %d\n", rc); return 2; }
 	rc = pam_authenticate(h, 0);
 	printf("  pam_authenticate(%s, %s) = %d (%s)\n",

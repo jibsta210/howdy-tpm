@@ -7,8 +7,9 @@ needs one — KDE Wallet, GNOME Keyring, an encrypted home — finds
 `PAM_AUTHTOK` empty and prompts anyway. You get recognised by your face and
 then asked for a password, which rather defeats the point.
 
-This module fixes that: the face match authorises the TPM to release a real
-secret, which is handed to the rest of the PAM stack as if you had typed it.
+This module provides a TPM-encrypted secret to downstream PAM modules. The PAM
+configuration must route a successful face match to it; the TPM itself does
+not check Howdy's result. Each module rule requires an explicit user and service.
 
 ---
 
@@ -32,15 +33,9 @@ one encoding is unrelated to a hash of the next, so there is nothing stable to
 derive a key from. And a face is not secret in the first place — your model
 file sits on disk next to the data it would be protecting.
 
-So the biometric authorises; the TPM holds. That is the only arrangement where
-"unlock with your face" is not a synonym for "keep the password in a file".
-
-Windows uses the same pattern, though in two independent places that are easy
-to conflate: BitLocker has the TPM release the volume key **at boot**, from PCR
-measurements, before any user exists — Hello is not involved. Hello separately
-has the TPM release your *credentials* after a biometric match, once you are at
-the login screen. This module is the second of those. The first is
-`systemd-cryptenroll --tpm2-device=auto`, and the two compose.
+Biometrics control the PAM path; the TPM protects the stored secret. This is
+not a Windows Hello implementation. TPM-backed disk encryption and session
+keyring unlock are separate operations.
 
 ---
 
@@ -53,6 +48,8 @@ readable by anyone who picks up the laptop" and "they are not".
 
 **Optionally protects against boot tampering** — bind to PCR 7 and the secret
 stops unsealing if Secure Boot state changes.
+The default binds to no PCRs. PCR 7 alone does not identify a particular OS or
+measure every file on the root filesystem.
 
 **Does not protect against** anyone using your machine while it is running and
 logged in, or anyone who can already run code as root. Nothing at this layer
@@ -92,6 +89,7 @@ you seal accordingly.
 - [Howdy](https://github.com/boltgolt/howdy), or any PAM module that
   authenticates without producing a password
 - `libpam` headers to build
+- C compiler, make, pkg-config; Python 3 for the read-only configuration helper
 
 No `tpm2-tools` needed.
 
@@ -104,9 +102,16 @@ make
 sudo make install
 ```
 
-Installs `pam_howdy_tpm.so` to `/usr/lib/security/` and `howdy-tpm-enroll` to
-`/usr/bin/`. **Installing does nothing on its own** — the module is inert until
-you add it to a PAM stack.
+The PAM directory is derived from Linux-PAM's pkg-config `libdir`, for example
+`/usr/lib64/security` on Fedora. Both `howdy-tpm` and `howdy-tpm-enroll` are
+installed, along with the inspection and authentication helpers. For a custom
+PAM installation, set `SECDIR=/absolute/module/directory`. `PREFIX`,
+`LIBEXECDIR`, and staging with `DESTDIR` are also supported. `install.sh` uses
+the same make targets.
+For a nondefault `LIBEXECDIR`, set `HOWDY_TPM_LIBEXECDIR` when invoking the CLI.
+
+On Fedora, the build dependencies include `gcc`, `make`, `pkgconf-pkg-config`,
+and `pam-devel`. Installation does not edit PAM or enroll any secret.
 
 ## Enrol a secret
 
@@ -118,6 +123,13 @@ Prompts twice, hidden. The secret goes straight to `systemd-creds` — never to 
 file, never into argv, never into shell history. Sealed to
 `/etc/howdy-tpm/secret.cred`, `root:root 600`, and read back before success is
 reported.
+Leading and trailing spaces are preserved. Replacement is verified in a
+temporary file before an atomic rename; a failed replacement keeps the old
+credential.
+
+The root-only credential directory can hide metadata from an unprivileged
+`doctor`; this does not establish that enrollment failed. Use
+`sudo howdy-tpm status` for an explicit decryption check.
 
 ```bash
 sudo howdy-tpm-enroll --show      # status; never prints the secret
@@ -133,29 +145,61 @@ sudo howdy-tpm-enroll --name ssh-key --cred /etc/howdy-tpm/ssh.cred
 
 ## Wire it into PAM
 
-**Placement matters, and the obvious placement is wrong.**
+Start with the actual login service and intended user, for example:
 
-Put it where the auth modules *converge on success* — the target of
-`pam_howdy`'s `success=N` jump — and before whatever consumes the token:
-
-```
-auth  requisite                   pam_faillock.so preauth
-auth  [success=N default=ignore]  pam_howdy.so
-auth  [success=1 default=bad]     pam_unix.so try_first_pass nullok
-auth  [default=die]               pam_faillock.so authfail
-auth  optional                    pam_permit.so
-auth  optional                    pam_howdy_tpm.so      <-- here
-auth  required                    pam_faillock.so authsucc
-auth  optional                    pam_kwallet5.so
+```bash
+howdy-tpm doctor --service sddm --user "$USER" --keyring kwallet
 ```
 
-Immediately **after** `pam_howdy` would be wrong: on success Howdy *jumps over*
-the following modules, so a module placed there runs only when face auth
-**failed** — exactly backwards.
+To get copyable setup commands instead of manually applying the diff:
 
-Adding a module shifts every `success=N` below it. Recount them; do not eyeball
-it. `tools/flatten-pam.py` prints the flattened stack with the jump targets
-resolved.
+```bash
+howdy-tpm doctor --service sddm --user "$USER" --keyring kwallet --emit-shell > /tmp/howdy-tpm-setup.sh
+less /tmp/howdy-tpm-setup.sh
+bash /tmp/howdy-tpm-setup.sh
+```
+
+Generation remains read-only; stack inspection goes to stderr and only the
+script goes to stdout. Execute the script after reviewing it. It refuses a
+changed service file or existing fragment, verifies the credential without
+printing it, backs up the original service under `/var/backups/howdy-tpm`,
+and prints a rollback command before installing the two files. Rollback restores
+the service file, then removes the generated fragment so setup can be repeated.
+It restores SELinux file labels when `restorecon` is available; TPM-access policy remains
+a separate administrator decision. The default doctor output remains a diff.
+
+`doctor` is read-only and does not decrypt credentials. It displays the actual
+authentication files, including repeated includes and substack boundaries. It
+does not pretend to simulate arbitrary PAM control flow. Use `--module-dir`
+when PAM's build metadata is unavailable, and `--cred`/`--name` for a custom
+credential.
+
+The first supported plan is a direct `auth sufficient pam_howdy.so`, immediately
+followed by a password-authentication `substack`, with existing optional keyring
+auth and `auto_start` session hooks. This covers the Fedora SDDM layout. The
+plan is a diff that creates a separate face-auth fragment and replaces just
+the Howdy rule with an `include`. If the usual Fedora `pam_selinux_permit`
+guard precedes Howdy, the plan also changes its failure action from `bad` to
+`die`: a denied login stops before any secret is released. Other authentication
+prefixes require manual review and receive no generated plan.
+
+- Face success runs the scoped credential module and the selected keyring auth
+  hook before returning success, just as the original sufficient rule did.
+- Face failure skips credential release and returns to the original password
+  substack. Password handling and session hooks are not rewritten.
+
+Review and apply both parts of the diff together. Keep an administrator session
+open and verify face success, password login, and rejected authentication before
+rebooting. The helper refuses to generate a plan for unsupported structures,
+parent numeric jumps, existing generated fragments, or authselect-managed entry
+files. It identifies authselect-managed included files without modifying them.
+It never guesses a `system-auth` insertion point.
+
+For an existing custom successful-authentication branch, the module rule needs
+both `user=YOUR_USER` and `service=YOUR_SERVICE`. Without both, it deliberately
+releases nothing. **Existing installations must add these options when upgrading.**
+Place it before the keyring consumer and after successful authentication;
+returning `PAM_IGNORE` does not make an incorrect placement safe.
 
 ### Module options
 
@@ -163,6 +207,8 @@ resolved.
 |---|---|---|
 | `cred=PATH` | `/etc/howdy-tpm/secret.cred` | sealed credential |
 | `name=NAME` | `howdy-tpm` | credential name (must match enrolment) |
+| `user=USER` | required | only this PAM user may receive the credential |
+| `service=NAME` | required | only this PAM service may receive the credential |
 | `debug` | off | log decisions to syslog — never the secret |
 
 ---
@@ -172,17 +218,28 @@ resolved.
 Iterating on an auth stack by rebooting is how people lock themselves out.
 Don't.
 
-`tests/pamtest.c` runs a real PAM conversation against any service and answers
-no prompts, so a stack that still needs a password fails visibly:
+The installed authentication helper runs a PAM conversation and supplies no
+password. The command preserves its failure status:
 
 ```bash
-gcc -o pamtest tests/pamtest.c -lpam
-sudo ./pamtest login "$USER"
+sudo howdy-tpm test --service sddm --user "$USER"
 ```
 
 A working face-only stack prints the Howdy messages and `Success` with **no**
 `Password:` prompt. If `Password:` appears, something downstream still wants
-one.
+one. This checks authentication only, not account policy, session startup, or
+the resulting state of a new desktop's keyring.
+
+For a separate read-only check of a wallet in the **current** KDE session:
+
+```bash
+sudo howdy-tpm test --service sddm --user "$USER" --wallet kdewallet
+```
+
+An already-open wallet is not proof that the tested login opened it. This check
+does not start the wallet daemon or ask it to unlock. A closed wallet or a
+failed D-Bus query causes a nonzero exit status. To inspect files without
+authenticating, use `howdy-tpm test --service sddm --user "$USER" --show-stack`.
 
 To prove the token is actually delivered, use `pam_exec` as an observer — see
 `tests/`.
@@ -193,18 +250,59 @@ To prove the token is actually delivered, use `pam_exec` as an observer — see
 sudo faillock --user "$USER" --reset
 ```
 
+### SELinux with SDDM
+
+On an enforcing system, a terminal authentication test can run in
+`unconfined_t`, while the actual SDDM helper runs in `xdm_t`. Terminal success
+therefore does not prove that the login screen can access the TPM. A denial
+for `systemd-creds` reading/writing `tpmrm0` with source type `xdm_t` and target
+type `tpm_device_t` prevents credential release; the keyring then receives no
+password. Inspect the real login's logs:
+
+```bash
+sudo journalctl -b --no-pager | grep -Ei 'pam_howdy_tpm|pam_kwallet5|systemd-creds|avc:'
+```
+
+For that verified denial, an administrator can review this optional local
+policy, saved as `howdy_tpm_sddm.te`:
+
+```text
+module howdy_tpm_sddm 1.0;
+require {
+    type xdm_t;
+    type tpm_device_t;
+    class chr_file { getattr open read write };
+}
+allow xdm_t tpm_device_t:chr_file { getattr open read write };
+```
+
+This grants TPM access to the **whole `xdm_t` domain**, not just this PAM
+module or `systemd-creds`. It is not installed automatically. Compile and
+install it with the SELinux policy tools:
+
+```bash
+checkmodule -M -m -o howdy_tpm_sddm.mod howdy_tpm_sddm.te
+semodule_package -o howdy_tpm_sddm.pp -m howdy_tpm_sddm.mod
+sudo semodule -X 300 -i howdy_tpm_sddm.pp
+```
+
+Remove it with `sudo semodule -X 300 -r howdy_tpm_sddm`. After installation,
+verify a fresh SDDM login and first application launch without manually
+unlocking the wallet. Other AVCs require their own diagnosis.
+
 ---
 
 ## Design notes
 
-**It never authenticates.** `pam_sm_authenticate` returns `PAM_IGNORE` on every
-path, including success. It supplies a token; it does not decide who may log
-in. Returning `PAM_SUCCESS` would let a readable credential file substitute for
-authentication.
+**It does not supply an authentication result.** `pam_sm_authenticate` returns
+`PAM_IGNORE` on every path. It still modifies `PAM_AUTHTOK`, which downstream
+modules can consume. Safe release depends on a successful-authentication path;
+user/service restrictions are checked before accessing the credential.
 
 **It never overwrites an existing token.** If `PAM_AUTHTOK` is already set —
-normally by `pam_unix` on the password path — it does nothing. One placement
-therefore serves both paths without knowing which ran.
+normally by `pam_unix` on the password path — it does nothing. The configuration
+must still prevent failed authentication from reaching credential release;
+an empty token does not establish success.
 
 **It refuses an unsafe credential.** Not root-owned, or any group/other
 permission bits, and it declines and logs. The file's contents become an
@@ -267,9 +365,11 @@ Also verified, in an isolated PAM service rather than by guessing:
 | credential owned non-root | refused |
 | credential missing | no token, no crash |
 
-Not yet done: an installer that edits PAM stacks for you. Deliberately — that
-is the part that can lock you out. `howdy-tpm doctor` prints the exact lines
-for your machine and you add them yourself.
+The supported configuration plan has isolated real-libpam regression tests for
+face success, password success, authentication failure, and user/service scope.
+TPM decryption and face recognition are mocked in these tests; they do not
+establish hardware, SELinux, or a real desktop cold-login result. Run `make check`
+with `uv` and PAM development files installed.
 
 ## Licence
 
