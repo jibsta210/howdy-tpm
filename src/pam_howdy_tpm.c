@@ -14,39 +14,30 @@
  *   from.
  *
  * THE APPROACH
- *   Keep the secret in the TPM. The face match does not become the key, it
- *   authorises the release of one. This is how Windows Hello unlocks BitLocker,
- *   and it is the only arrangement where "unlock with your face" is not just
- *   storing the password in a file.
+ *   TPM-bound encryption protects the stored secret. PAM configuration must
+ *   route only a successful authentication to this module; the TPM does not
+ *   verify Howdy's result.
  *
  * WHERE IT GOES IN THE STACK
- *   At the point the preceding auth modules CONVERGE on success -- i.e. the
- *   target of pam_howdy's `success=N` jump, before the modules that consume
- *   PAM_AUTHTOK:
- *
- *     auth [success=N default=ignore] pam_howdy.so
- *     auth [success=1 default=bad]    pam_unix.so try_first_pass nullok
- *     ...
- *     auth optional                   pam_howdy_tpm.so    <-- here
- *     auth optional                   pam_kwallet5.so
- *
- *   Placing it immediately AFTER pam_howdy would be wrong: on success howdy
- *   jumps over it, so it would run only when face auth FAILED -- exactly
- *   backwards.
+ *   On an explicitly successful authentication branch, before the modules
+ *   that consume PAM_AUTHTOK. Failed authentication must not reach it, even
+ *   if an earlier required module retained a failure. The doctor command
+ *   prints a review-only fragment for the supported Howdy stack structure.
  *
  * WHY IT IS SAFE ON THE PASSWORD PATH
  *   It only acts when PAM_AUTHTOK is unset or empty. If the user typed a
- *   password, pam_unix has already stored it and this module does nothing. So
- *   one placement serves both paths without needing to know which one ran.
+ *   password, pam_unix has already stored it and this module does nothing.
+ *   This token check is not proof of successful authentication.
  *
  * WHAT IT DOES NOT DO
- *   It never authenticates anybody. It returns PAM_IGNORE in every path, so it
- *   cannot grant access, and a failure here degrades to "you get a password
- *   prompt", never to "anyone gets in".
+ *   It returns PAM_IGNORE in every path, but setting PAM_AUTHTOK still affects
+ *   downstream consumers. Do not place it before password authentication.
  *
  * Options:
  *   cred=PATH     sealed credential          (default /etc/howdy-tpm/secret.cred)
  *   name=NAME     credential name            (default howdy-tpm)
+ *   user=USER     permitted PAM user         (required)
+ *   service=NAME  permitted PAM service      (required)
  *   debug         log decisions (never the secret)
  *
  * SPDX-License-Identifier: MIT
@@ -73,6 +64,8 @@
 struct opts {
 	const char *cred;
 	const char *name;
+	const char *user;
+	const char *service;
 	int debug;
 };
 
@@ -80,6 +73,8 @@ static void parse_opts(struct opts *o, int argc, const char **argv)
 {
 	o->cred = DEFAULT_CRED;
 	o->name = DEFAULT_NAME;
+	o->user = NULL;
+	o->service = NULL;
 	o->debug = 0;
 
 	for (int i = 0; i < argc; i++) {
@@ -87,6 +82,10 @@ static void parse_opts(struct opts *o, int argc, const char **argv)
 			o->cred = argv[i] + 5;
 		else if (!strncmp(argv[i], "name=", 5))
 			o->name = argv[i] + 5;
+		else if (!strncmp(argv[i], "user=", 5))
+			o->user = argv[i] + 5;
+		else if (!strncmp(argv[i], "service=", 8))
+			o->service = argv[i] + 8;
 		else if (!strcmp(argv[i], "debug"))
 			o->debug = 1;
 	}
@@ -184,7 +183,7 @@ static char *unseal(pam_handle_t *pamh, const struct opts *o)
 	if (waitpid(pid, &status, 0) < 0 ||
 	    !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
 		pam_syslog(pamh, LOG_NOTICE,
-			   "systemd-creds could not unseal %s (TPM state changed?)",
+			   "systemd-creds could not unseal %s; check the credential, TPM access and SELinux audit logs",
 			   o->cred);
 		if (buf) { explicit_bzero(buf, MAX_SECRET); free(buf); }
 		return NULL;
@@ -211,11 +210,22 @@ int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **ar
 {
 	struct opts o;
 	const void *existing = NULL;
+	const void *user = NULL, *service = NULL;
 	char *secret;
 	int rc;
 
 	(void)flags;
 	parse_opts(&o, argc, argv);
+
+	if (!o.user || !*o.user || !o.service || !*o.service) {
+		pam_syslog(pamh, LOG_ERR, "user= and service= are required; refusing to release a credential");
+		return PAM_IGNORE;
+	}
+	if (pam_get_item(pamh, PAM_USER, &user) != PAM_SUCCESS || !user ||
+	    strcmp(user, o.user) != 0 ||
+	    pam_get_item(pamh, PAM_SERVICE, &service) != PAM_SUCCESS || !service ||
+	    strcmp(service, o.service) != 0)
+		return PAM_IGNORE;
 
 	/*
 	 * If something already established a token -- normally pam_unix on the
